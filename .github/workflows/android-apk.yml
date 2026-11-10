@@ -1,0 +1,179 @@
+name: HGhub v1.2.1 Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      include_armv7:
+        description: Also build armeabi-v7a for older 32-bit Android phones
+        type: boolean
+        required: false
+        default: false
+
+# This workflow uploads Actions artifacts only. It cannot publish a Release.
+permissions:
+  contents: read
+
+concurrency:
+  group: hghub-v1.2.1-android-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CI: "true"
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  SOURCE_COMMIT: 5f88442961ad9cdac50af4421cf76b3ac06d64e2
+
+jobs:
+  android:
+    name: Build installable APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out immutable v1.2.1 source
+        uses: actions/checkout@v4
+        with:
+          repository: Minireel/HGhub
+          # Peeled commit of the annotated v1.2.1 tag, not the moving main branch.
+          ref: 5f88442961ad9cdac50af4421cf76b3ac06d64e2
+          persist-credentials: false
+
+      - name: Verify source version
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          for (const p of ['package.json', 'src-tauri/tauri.conf.json']) {
+            const v = JSON.parse(fs.readFileSync(p, 'utf8')).version;
+            if (v !== '1.2.1') throw new Error(`${p}: expected 1.2.1, got ${v}`);
+          }
+          NODE
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK and NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          # GitHub's Ubuntu runner already supplies the Android command-line tools.
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" --install \
+            "platform-tools" "platforms;android-36" \
+            "build-tools;36.0.0" "ndk;28.2.13676358"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$SDK/ndk/28.2.13676358" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          shared-key: hghub-v1.2.1-android
+
+      - name: Install locked JavaScript dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate Android project
+        run: pnpm tauri android init --ci
+
+      - name: Build release APK with bundled production frontend
+        shell: bash
+        env:
+          INCLUDE_ARMV7: ${{ inputs.include_armv7 }}
+        run: |
+          set -euo pipefail
+          targets=(aarch64)
+          if [[ "$INCLUDE_ARMV7" == "true" ]]; then targets+=(armv7); fi
+          # The release build runs beforeBuildCommand (pnpm build + icon sync)
+          # and embeds dist/. It does not need a Vite development server.
+          pnpm tauri android build --ci --apk --split-per-abi --target "${targets[@]}"
+          git diff --exit-code -- pnpm-lock.yaml src-tauri/Cargo.lock
+
+      - name: Align, self-sign and verify APKs
+        shell: bash
+        env:
+          INCLUDE_ARMV7: ${{ inputs.include_armv7 }}
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_SDK_ROOT/build-tools/36.0.0"
+          KS="$RUNNER_TEMP/hghub-debug.keystore"
+          trap 'rm -f "$KS"' EXIT
+          # A fresh local Android test certificate; no upstream signing secrets.
+          # This key changes for each run. Existing differently signed installs
+          # must be uninstalled before installing this independently built APK.
+          keytool -genkeypair -noprompt -keystore "$KS" -storetype JKS \
+            -storepass android -keypass android -alias androiddebugkey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+          mkdir -p artifacts
+          found=0
+          while IFS= read -r -d '' apk; do
+            abi="$(unzip -Z1 "$apk" | awk -F/ '$1 == "lib" && $3 ~ /\.so$/ { print $2 }' | sort -u)"
+            case "$abi" in
+              arm64-v8a|armeabi-v7a) ;;
+              *) echo "::error::Unexpected or multiple native ABIs in $apk: $abi"; exit 1 ;;
+            esac
+            out="artifacts/HGhub_1.2.1_${abi}_selfsigned.apk"
+            test ! -e "$out"
+            "$BT/zipalign" -P 16 -f 4 "$apk" "$RUNNER_TEMP/aligned-${abi}.apk"
+            "$BT/apksigner" sign --ks "$KS" --ks-key-alias androiddebugkey \
+              --ks-pass pass:android --key-pass pass:android \
+              --v4-signing-enabled false --out "$out" "$RUNNER_TEMP/aligned-${abi}.apk"
+            "$BT/apksigner" verify --verbose --print-certs "$out" | tee "artifacts/${abi}-signature.txt"
+            "$BT/zipalign" -c -P 16 4 "$out"
+            "$BT/aapt" dump badging "$out" > "artifacts/${abi}-package.txt"
+            grep -F "versionName='1.2.1'" "artifacts/${abi}-package.txt"
+            found=$((found + 1))
+          done < <(find src-tauri/gen/android/app/build/outputs/apk -type f -name '*release*.apk' -print0)
+          expected=1
+          if [[ "$INCLUDE_ARMV7" == "true" ]]; then expected=2; fi
+          test "$found" -eq "$expected"
+          test -s artifacts/HGhub_1.2.1_arm64-v8a_selfsigned.apk
+          cat > artifacts/BUILD-INFO.txt <<EOF
+          HGhub v1.2.1 independently built Android APK
+          Source: https://github.com/Minireel/HGhub/tree/$SOURCE_COMMIT
+          Source commit: $SOURCE_COMMIT
+          Workflow: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+          Build: release, bundled production frontend, minSdkVersion 24 (Android 7.0)
+          Signing: fresh local Android test certificate, not the upstream author's key
+          Installation: uninstall any existing differently signed HGhub first (this removes its local data).
+          Retention: Actions artifacts expire 30 days after this run.
+          EOF
+          (cd artifacts && sha256sum *.apk > SHA256SUMS.txt)
+          ls -lh artifacts
+          echo "### HGhub v1.2.1 APK" >> "$GITHUB_STEP_SUMMARY"
+          echo "Source: \`$SOURCE_COMMIT\`. Release build with bundled frontend; self-signed test certificate." >> "$GITHUB_STEP_SUMMARY"
+          echo "Download the HGhub-v1.2.1-Android-APK artifact below. Unzip it and choose arm64-v8a for most current phones." >> "$GITHUB_STEP_SUMMARY"
+          echo "Existing installations signed with another key must be uninstalled first; uninstalling removes local app data." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload downloadable APK artifact
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: HGhub-v1.2.1-Android-APK
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Add direct artifact link
+        shell: bash
+        env:
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+        run: echo "[Download APK artifact]($ARTIFACT_URL)" >> "$GITHUB_STEP_SUMMARY"
